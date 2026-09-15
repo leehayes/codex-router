@@ -206,6 +206,7 @@ export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json
 export const LITELLM_CONFIG_PATH = path.join(STATE_DIR, "litellm.yaml");
 export const INTERNAL_SECRET_PATH = path.join(STATE_DIR, "internal-secret");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
+export const WORKER_ADMIN_SECRET_PATH = path.join(STATE_DIR, "worker-admin-secret");
 export const CURSOR_PUBLIC_SECRET_PATH = path.join(STATE_DIR, "cursor-public-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
 export const LOGIN_FREE_REFRESH_JOURNAL_PATH = path.join(

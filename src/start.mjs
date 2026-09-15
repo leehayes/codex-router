@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 
 import { assertCallerSecret } from "./caller-auth.mjs";
@@ -14,6 +15,7 @@ import {
   SOURCE_ROOT,
   STATE_DIR,
   TARGET,
+  WORKER_ADMIN_SECRET_PATH,
   loopback,
 } from "./paths.mjs";
 import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
@@ -25,6 +27,7 @@ import { readLocalModelSelection } from "./local-models.mjs";
 import { antigravityOAuthStartupState } from "./antigravity-oauth-status.mjs";
 import { attemptAntigravityProbePromotionAfterReadiness } from "./antigravity-probe-activation.mjs";
 import { spawnableCommand } from "./spawnable-command.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
 import { venvRuntimeProblem } from "./venv-runtime.mjs";
 import { dependencyRepairHint } from "./dependency-repair.mjs";
@@ -123,6 +126,10 @@ if (!internalKey) throw new Error("Internal service key is empty.");
 const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
+if (!existsSync(WORKER_ADMIN_SECRET_PATH)) {
+  writePrivateFile(WORKER_ADMIN_SECRET_PATH, `${randomBytes(32).toString("base64url")}\n`, { directoryMode: 0o700 });
+}
+const workerAdminKey = assertCallerSecret(readFileSync(WORKER_ADMIN_SECRET_PATH, "utf8").trim());
 writeLiteLlmConfig();
 
 // Drop enabled providers this build cannot authenticate (missing credential,
@@ -199,6 +206,7 @@ const commonEnv = {
   MODEL_ROUTER_QUIET: "1",
   CODEX_ROUTER_CALLER_KEY: callerKey,
   CODEX_ROUTER_INTERNAL_KEY: internalKey,
+  CODEX_ROUTER_WORKER_ADMIN_KEY: workerAdminKey,
   KIMI_INTERNAL_KEY: internalKey,
   KIMI_OAUTH_FORWARD_BASE_URL: loopback(PORTS.oauth, "/v1"),
   CODEX_ROUTER_API_FORWARD_BASE_URL: loopback(PORTS.api, "/v1"),

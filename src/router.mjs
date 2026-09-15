@@ -89,6 +89,16 @@ import {
 } from "./deepseek-responses.mjs";
 import { exactRouteProbeRequested } from "./exact-route-probe.mjs";
 import {
+  authorizeWorkerCapability,
+  bindWorkerLease,
+  closeWorkerLease,
+  createWorkerLease,
+  markWorkerAttemptForwarded,
+  reserveWorkerAttempt,
+  settleWorkerAttempt,
+  workerLeaseStatus,
+} from "./worker-leases.mjs";
+import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
   PORTS,
@@ -284,6 +294,7 @@ const CATALOG_PATH =
 const INTERNAL_KEY =
   process.env.CODEX_ROUTER_INTERNAL_KEY || process.env.KIMI_INTERNAL_KEY;
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
+const WORKER_ADMIN_KEY = process.env.CODEX_ROUTER_WORKER_ADMIN_KEY;
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
 function positiveByteLimit(value, fallback) {
@@ -2741,13 +2752,37 @@ async function summarizeWith(
   }
   // Compaction is another hop on the route's transport: a Grok summary can
   // reason for as long as a turn, so it uses the same long-idle pool.
+  const compactRequestId = request.codexRouterWorkerCapability
+    ? `${randomUUID()}-compact`
+    : undefined;
+  if (request.codexRouterWorkerCapability) {
+    const authorized = authorizeWorkerCapability(request.codexRouterWorkerCapability, request.codexRouterWorkerJobId, route.slug);
+    if (!authorized.ok) throw Object.assign(new Error(`Worker capability rejected: ${authorized.reason}`), { code: "worker_capability_rejected", status: 403 });
+    const reservation = reserveWorkerAttempt({
+      capability: request.codexRouterWorkerCapability,
+      jobId: request.codexRouterWorkerJobId,
+      route: route.slug,
+      requestId: compactRequestId,
+      kind: "compaction",
+      inputTokens: Math.min(32768, Math.max(0, Math.ceil(Number(estimateInputTokens(serialized)) || authorized.job.budget.requestInputTokens))),
+      outputTokens: Math.min(8000, Number(authorized.job.budget.requestOutputTokens) || 1),
+    });
+    if (!reservation.ok) throw Object.assign(new Error(`Worker budget rejected: ${reservation.reason}`), { code: "worker_budget_exhausted", status: 429 });
+  }
   const upstream = await fetchForRoute(route, routedResponsesTarget(route), {
     method: "POST",
     headers: routedHeaders(),
     body: serialized,
     signal,
   });
-  return { upstream, bridged, bytes: Buffer.byteLength(serialized, "utf8") };
+  if (compactRequestId) {
+    markWorkerAttemptForwarded({
+      jobId: request.codexRouterWorkerJobId,
+      requestId: compactRequestId,
+      providerRequestId: upstream.headers.get("x-request-id") || upstream.headers.get("request-id") || upstream.headers.get("openai-request-id"),
+    });
+  }
+  return { upstream, bridged, bytes: Buffer.byteLength(serialized, "utf8"), workerAttemptId: compactRequestId };
 }
 
 async function summarize(request, payload, route, signal, { allowFailover = true } = {}) {
@@ -2827,6 +2862,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
       });
     } catch (error) {
       if (error?.code === "ERR_UPSTREAM_RESPONSE_TOO_LARGE") {
+        if (sent.workerAttemptId) settleWorkerAttempt({ jobId: request.codexRouterWorkerJobId, requestId: sent.workerAttemptId, status: "ambiguous" });
         return {
           ok: false,
           status: 502,
@@ -2834,9 +2870,11 @@ async function summarize(request, payload, route, signal, { allowFailover = true
           toolResultAging: aged.stats,
         };
       }
+      if (sent.workerAttemptId) settleWorkerAttempt({ jobId: request.codexRouterWorkerJobId, requestId: sent.workerAttemptId, status: "ambiguous" });
       throw error;
     }
     if (bytes.length > 32 * 1024 * 1024) {
+      if (sent.workerAttemptId) settleWorkerAttempt({ jobId: request.codexRouterWorkerJobId, requestId: sent.workerAttemptId, status: "ambiguous" });
       return {
         ok: false,
         status: 502,
@@ -2844,12 +2882,26 @@ async function summarize(request, payload, route, signal, { allowFailover = true
         toolResultAging: aged.stats,
       };
     }
-    const parsed = JSON.parse(bytes.toString("utf8"));
+    let parsed;
+    try {
+      parsed = JSON.parse(bytes.toString("utf8"));
+    } catch (error) {
+      if (sent.workerAttemptId) settleWorkerAttempt({ jobId: request.codexRouterWorkerJobId, requestId: sent.workerAttemptId, status: "ambiguous" });
+      throw error;
+    }
     // Compaction is a plain non-streaming call, so the usage block (when the
     // provider sends one) is already in hand. `tokenUsageFromPayload` returns
     // undefined when it is absent, and `recordUsageEvent` then omits the token
     // fields entirely rather than metering an invented zero.
     const usage = tokenUsageFromPayload(parsed);
+    if (sent.workerAttemptId) {
+      settleWorkerAttempt({
+        jobId: request.codexRouterWorkerJobId,
+        requestId: sent.workerAttemptId,
+        status: sent.upstream.ok ? "completed" : "failed",
+        usage,
+      });
+    }
     if (sent.upstream.ok) {
       clearProviderCooldown(attemptRoute.provider);
       const answer = extractResponseText(parsed);
@@ -3800,7 +3852,75 @@ async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const controller = new AbortController();
   const activity = beginRequestActivity({ request, response, controller });
+  let workerLease;
+  let workerAttemptNumber = 0;
+  const workerAttempts = [];
+  const settleNextWorkerAttempt = (status, attemptUsage = undefined) => {
+    const attempt = workerAttempts.find((entry) => !entry.settled);
+    if (!attempt) return;
+    settleWorkerAttempt({
+      jobId: request.codexRouterWorkerJobId,
+      requestId: attempt.requestId,
+      status,
+      usage: attemptUsage,
+    });
+    attempt.settled = true;
+  };
   const fetchObservedUpstream = async (url, init) => {
+    if (request.codexRouterWorkerCapability) {
+      if (!route) throw Object.assign(new Error("Worker request has no exact route"), { code: "worker_route_required" });
+      if (!workerLease) {
+        const authorized = authorizeWorkerCapability(
+          request.codexRouterWorkerCapability,
+          request.codexRouterWorkerJobId,
+          route.slug,
+        );
+        if (!authorized.ok) throw Object.assign(new Error(`Worker capability rejected: ${authorized.reason}`), { code: "worker_capability_rejected", status: 403 });
+        workerLease = authorized.job;
+      }
+      if (workerLease.route !== route.slug) {
+        throw Object.assign(new Error("Worker route failover is disabled"), { code: "worker_route_mismatch", status: 409 });
+      }
+      const kindHeader = String(request.headers["x-codex-router-worker-attempt-kind"] || "");
+      const kind = workerAttemptNumber > 0
+        ? "retry"
+        : ["initial", "followup"].includes(kindHeader) ? kindHeader : "initial";
+      let inputTokens = 0;
+      try {
+        const estimated = estimateInputTokens(init?.body || "");
+        inputTokens = Number.isFinite(estimated) ? Math.min(32768, Math.max(0, Math.ceil(estimated))) : workerLease.budget.requestInputTokens;
+      } catch { inputTokens = workerLease.budget.requestInputTokens; }
+      const outputTokens = Math.min(8000, Math.max(1, Number(workerLease.budget.requestOutputTokens) || 1));
+      const reservation = reserveWorkerAttempt({
+        capability: request.codexRouterWorkerCapability,
+        jobId: request.codexRouterWorkerJobId,
+        route: route.slug,
+        requestId: `${activity.requestId}-${workerAttemptNumber}`,
+        kind,
+        inputTokens,
+        outputTokens,
+      });
+      if (!reservation.ok) throw Object.assign(new Error(`Worker budget rejected: ${reservation.reason}`), { code: "worker_budget_exhausted", status: 429 });
+      const attemptId = `${activity.requestId}-${workerAttemptNumber}`;
+      workerAttemptNumber += 1;
+      const workerAttempt = { requestId: attemptId, settled: false };
+      workerAttempts.push(workerAttempt);
+      try {
+        activity.progress.attempt();
+        const upstream = await fetchForRoute(route, url, init);
+        activity.progress.headers();
+        markWorkerAttemptForwarded({
+          jobId: request.codexRouterWorkerJobId,
+          requestId: attemptId,
+          providerRequestId: upstream.headers.get("x-request-id") || upstream.headers.get("request-id") || upstream.headers.get("openai-request-id"),
+        });
+        return upstream;
+      } catch (error) {
+        settleWorkerAttempt({ jobId: request.codexRouterWorkerJobId, requestId: attemptId, status: "ambiguous" });
+        workerAttempt.settled = true;
+        throw error;
+      }
+    }
     activity.progress.attempt();
     const upstream = await fetchForRoute(route, url, init);
     activity.progress.headers();
@@ -3891,6 +4011,15 @@ async function handleResponses(request, response, requestUrl) {
     route = registeredRoute && routeProviderEnabled(registeredRoute.provider)
       ? registeredRoute
       : undefined;
+    if (request.codexRouterWorkerCapability && !route) {
+      writeJson(response, 409, {
+        error: {
+          type: "worker_route_required",
+          message: "A worker capability may address only its exact certified route.",
+        },
+      });
+      return;
+    }
     if (registeredRoute && !route) {
       writeJson(response, 409, {
         error: {
@@ -3933,7 +4062,7 @@ async function handleResponses(request, response, requestUrl) {
         route,
         controller.signal,
         compactV2,
-        { allowFailover: !exactRouteProbe },
+        { allowFailover: !exactRouteProbe && !request.codexRouterWorkerCapability },
       );
       const compacted = compaction.route || route;
       recordCompactionUsage(compaction, route, startedAt, diagnostics);
@@ -4037,7 +4166,7 @@ async function handleResponses(request, response, requestUrl) {
       // less than the request it avoids. The cooldown expires by itself, so
       // the operator's chosen model comes back without anyone doing anything.
       const settings = readFailoverSettings();
-      const cooled = !exactRouteProbe && settings.enabled
+      const cooled = !exactRouteProbe && !request.codexRouterWorkerCapability && settings.enabled
         ? providerCooldown(route.provider)
         : undefined;
       if (cooled) {
@@ -4195,6 +4324,7 @@ async function handleResponses(request, response, requestUrl) {
     // once. Nothing is relayed either way, so reading it is free.
     let failedBodyText;
     if (route && !upstream.ok) {
+      if (request.codexRouterWorkerCapability) settleNextWorkerAttempt("failed");
       failedBodyText = await boundedResponseText(
         upstream,
         MAX_BUFFERED_RESPONSE_BYTES,
@@ -4244,7 +4374,7 @@ async function handleResponses(request, response, requestUrl) {
               retryAfterSeconds: retryAfterSeconds(upstream.headers),
             });
       }
-      if (!upstream.ok && verdict.swap && !exactRouteProbe) {
+      if (!upstream.ok && verdict.swap && !exactRouteProbe && !request.codexRouterWorkerCapability) {
         // Believe the provider about when it will be back before trying anyone
         // else, so the next turn skips it instead of paying for the same
         // rejection again.
@@ -4542,6 +4672,13 @@ async function handleResponses(request, response, requestUrl) {
       );
     }
     usage = usageTransform?.tokenUsage();
+    if (request.codexRouterWorkerCapability) {
+      const completed = usageTransform?.completedResponseObserved() === true || usage !== undefined;
+      settleNextWorkerAttempt(
+        clientGone || !completed ? "ambiguous" : upstream.ok ? "completed" : "failed",
+        completed ? usage : undefined,
+      );
+    }
     // Time to the first generated token, which is what an output-tokens-per-
     // second figure has to divide by. `upstreamLatencyMs` stops at the response
     // headers, and on a reasoning model the gap between the two is seconds of
@@ -4664,6 +4801,7 @@ async function handleResponses(request, response, requestUrl) {
             rejectedResponse,
             controller.signal,
           );
+          if (request.codexRouterWorkerCapability) settleNextWorkerAttempt("failed", retryUsage);
           const rejectedClientWalkedAway =
             clientGone || (response.destroyed && !response.writableFinished);
           if (rejectedClientWalkedAway) {
@@ -4769,6 +4907,13 @@ async function handleResponses(request, response, requestUrl) {
             emptyCompletion = false;
           }
           retryUsage = retryUsageTransform?.tokenUsage();
+          if (request.codexRouterWorkerCapability) {
+            const retryCompleted = retryUsageTransform?.completedResponseObserved() === true || retryUsage !== undefined;
+            settleNextWorkerAttempt(
+              retryClientWalkedAway || !retryCompleted ? "ambiguous" : upstream2.ok ? "completed" : "failed",
+              retryCompleted ? retryUsage : undefined,
+            );
+          }
         }
       }
       // Both attempts were billed, so the meter reports both. A retry that
@@ -5034,6 +5179,16 @@ async function handleResponses(request, response, requestUrl) {
     }
     throw error;
   } finally {
+    if (request.codexRouterWorkerCapability) {
+      for (const attempt of workerAttempts.filter((entry) => !entry.settled)) {
+        settleWorkerAttempt({
+          jobId: request.codexRouterWorkerJobId,
+          requestId: attempt.requestId,
+          status: "ambiguous",
+        });
+        attempt.settled = true;
+      }
+    }
     const status = activityStatus ?? finalStatus ?? response.statusCode;
     activity.finish(status);
     // Timestamped per-request timing for latency diagnosis. Never gated on
@@ -5440,6 +5595,67 @@ async function handleRequest(request, response) {
     request.url || "/",
     `http://${request.headers.host || LISTEN_HOST}`,
   );
+  if (requestUrl.pathname.startsWith("/_codex-router/worker-control")) {
+    const presented = bearerToken(request.headers.authorization);
+    if (!WORKER_ADMIN_KEY || !presented || !secretEqual(presented, WORKER_ADMIN_KEY)) {
+      writeJson(response, 401, { error: { type: "worker_control_unauthorized" } });
+      return;
+    }
+    const relative = requestUrl.pathname.slice("/_codex-router/worker-control".length);
+    const match = relative.match(/^\/jobs\/([A-Za-z0-9_.:-]{1,160})(?:\/(bind|finish))?$/);
+    if (request.method === "GET" && match && !match[2]) {
+      writeJson(response, 200, workerLeaseStatus(match[1]));
+      return;
+    }
+    if (request.method !== "POST") {
+      writeJson(response, 405, { error: { type: "worker_control_method_not_allowed" } });
+      return;
+    }
+    let body;
+    try {
+      const bytes = await readRequestBody(request, { maxBytes: 64 * 1024 });
+      body = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      writeJson(response, 400, { error: { type: "invalid_worker_control_request" } });
+      return;
+    }
+    if (relative === "/jobs") {
+      const created = createWorkerLease({
+        jobId: body.jobId,
+        route: body.route,
+        budget: body.budget,
+        ttlMs: body.ttlMs,
+        policy: { ...(body.policy || {}), purpose: body.purpose || "production" },
+        runtimeSha256: body.runtimeSha256,
+        allowance: body.allowance,
+        approvedFileCount: body.approvedFileCount ?? body.scope?.approved_files?.length,
+        approvedCommandCount: body.approvedCommandCount ?? body.scope?.test_commands?.length,
+        allowsEdits: body.allowsEdits ?? body.scope?.allow_edits,
+        metadata: {
+          taskId: body.taskId,
+          turnId: body.turnId,
+          coordinatorModel: body.coordinatorModel,
+          coordinatorReasoning: body.coordinatorReasoning,
+          scopeSha256: body.scopeSha256,
+        },
+      });
+      writeJson(response, 201, { job: workerLeaseStatus(created.jobId), jobId: created.jobId,
+        route: created.route, expiresAt: created.expiresAt, workerCapability: created.capability });
+      return;
+    }
+    if (match?.[2] === "bind") {
+      writeJson(response, 200, bindWorkerLease({ jobId: match[1], childSessionId: body.childSessionId }));
+      return;
+    }
+    if (match?.[2] === "finish") {
+      closeWorkerLease({ jobId: match[1], outcome: body.state || body.outcome,
+        accepted: body.accepted, reviewMinutes: body.reviewMinutes });
+      writeJson(response, 200, workerLeaseStatus(match[1]));
+      return;
+    }
+    writeJson(response, 404, { error: { type: "worker_control_route_not_found" } });
+    return;
+  }
   if (request.method === "GET" && requestUrl.pathname === "/health") {
     const health = await healthPayload();
     writeJson(response, health.ok ? 200 : 503, {
@@ -5462,6 +5678,11 @@ async function handleRequest(request, response) {
     });
     return;
   }
+  // Worker capabilities are accepted only on the already-authenticated
+  // caller surface.  The child proxy supplies a job id and an exact route;
+  // ordinary native Codex traffic never carries either header.
+  request.codexRouterWorkerCapability = request.headers["x-codex-router-worker-capability"];
+  request.codexRouterWorkerJobId = request.headers["x-codex-router-worker-job-id"];
   const hookEndpoint = codexPatchHookEndpoint(route);
   requestUrl.pathname = hookEndpoint.pathname;
   request.codexRouterPatchHookCapability = hookEndpoint.capability;

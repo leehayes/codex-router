@@ -1,6 +1,6 @@
 {
   "name": "codex-model-router",
-  "version": "0.5.1",
+  "version": "0.5.1+opencode-worker.1",
   "private": true,
   "type": "module",
   "description": "Extensible local model router for Codex and Cursor",
@@ -9,7 +9,8 @@
   },
   "scripts": {
     "check": "node scripts-check.mjs",
-    "test": "node --test --test-timeout=600000 test/*.test.mjs"
+    "test": "node --test --test-timeout=600000 test/*.test.mjs",
+    "worker:manifest": "node src/worker-release-manifest.mjs && node src/worker-runtime-manifest.mjs"
   },
   "dependencies": {
     "proper-lockfile": "4.1.2",
