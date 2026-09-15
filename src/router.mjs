@@ -93,6 +93,7 @@ import {
   bindWorkerLease,
   closeWorkerLease,
   createWorkerLease,
+  fillCertificationBudget,
   markWorkerAttemptForwarded,
   reserveWorkerAttempt,
   settleWorkerAttempt,
@@ -5602,7 +5603,7 @@ async function handleRequest(request, response) {
       return;
     }
     const relative = requestUrl.pathname.slice("/_codex-router/worker-control".length);
-    const match = relative.match(/^\/jobs\/([A-Za-z0-9_.:-]{1,160})(?:\/(bind|finish))?$/);
+    const match = relative.match(/^\/jobs\/([A-Za-z0-9_.:-]{1,160})(?:\/(bind|finish|exhaust))?$/);
     if (request.method === "GET" && match && !match[2]) {
       writeJson(response, 200, workerLeaseStatus(match[1]));
       return;
@@ -5651,6 +5652,11 @@ async function handleRequest(request, response) {
       closeWorkerLease({ jobId: match[1], outcome: body.state || body.outcome,
         accepted: body.accepted, reviewMinutes: body.reviewMinutes });
       writeJson(response, 200, workerLeaseStatus(match[1]));
+      return;
+    }
+    if (match?.[2] === "exhaust") {
+      writeJson(response, 200, fillCertificationBudget({ jobId: match[1], route: body.route,
+        capability: body.workerCapability }));
       return;
     }
     writeJson(response, 404, { error: { type: "worker_control_route_not_found" } });

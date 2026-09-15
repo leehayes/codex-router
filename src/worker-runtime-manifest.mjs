@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { STATE_DIR } from "./paths.mjs";
+import { commandOnPath } from "./spawnable-command.mjs";
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 
@@ -18,15 +19,20 @@ export function buildWorkerRuntimeManifest({
   const release = JSON.parse(releaseBytes.toString("utf8"));
   if (!/^[a-f0-9]{64}$/.test(release.sourceHash || "")) throw new Error("Router release manifest has no valid source identity");
   const launcherBytes = readFileSync(launcherPath);
+  const sandboxRuntimeBytes = readFileSync(path.join(stateDir, "worker-sandbox-runtime", "runtime.json"));
+  const sandboxRuntime = JSON.parse(sandboxRuntimeBytes.toString("utf8"));
   const versionMatch = launcherBytes.toString("utf8").match(/^APP_SERVER_CLIENT_VERSION\s*=\s*"([^"\r\n]+)"/m);
   if (!versionMatch) throw new Error("Isolation launcher version is unavailable");
   if (!codexBinary && process.platform === "win32") {
-    codexBinary = execFileSync("where.exe", ["codex"], { encoding: "utf8" }).split(/\r?\n/).find(Boolean);
+    codexBinary = commandOnPath("codex");
   }
   codexBinary ||= "codex";
   const output = execFileSync(codexBinary, ["--version"], { encoding: "utf8" }).trim();
   const buildMatch = output.match(/^(?:codex(?:-cli)?\s+)?([0-9][A-Za-z0-9.+_-]*)$/);
   if (!buildMatch) throw new Error("Installed Codex build is unverifiable");
+  if (sandboxRuntime.version !== 1 || sandboxRuntime.codex_build !== buildMatch[1]) {
+    throw new Error("Worker sandbox runtime does not match the installed Codex build");
+  }
   return {
     version: 1,
     router_source_hash: release.sourceHash,
@@ -34,6 +40,7 @@ export function buildWorkerRuntimeManifest({
     codex_build: buildMatch[1],
     launcher_version: versionMatch[1],
     launcher_sha256: sha256(launcherBytes),
+    sandbox_runtime_sha256: sha256(sandboxRuntimeBytes),
   };
 }
 

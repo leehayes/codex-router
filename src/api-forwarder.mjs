@@ -86,6 +86,7 @@ import { requestGenericProvider } from "./generic-providers.mjs";
 import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import { withoutInputMessagePhase } from "./message-phase.mjs";
 import { providerTransportError } from "./transport-failure.mjs";
+import { normalizeQwenFlashMessagesText } from "./qwen-messages-compat.mjs";
 import {
   endpointCapabilityError,
   supportsOpenAIModelEndpoint,
@@ -854,6 +855,7 @@ function normalizeBody(buffer, contentType, route) {
       payload.messages = restoreNativeReasoningContent(payload.messages);
     }
   }
+  normalizeQwenFlashMessagesText(payload, provider, model);
   if (provider.authProfile === "github-copilot") {
     // This is native ChatGPT account metadata, not an upstream scheduling
     // request Copilot accepts.

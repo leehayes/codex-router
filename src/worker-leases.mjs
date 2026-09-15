@@ -14,8 +14,9 @@ const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const CERTIFICATION_ROUTES = new Set([
   "opencode-go-messages/minimax-m3", "opencode-go/mimo-v2.5",
   "opencode-go-responses/grok-4.6", "opencode-go/kimi-k2.7-code",
-  "opencode-go-messages/qwen3.8-flash", "opencode-go/glm-5.3-flash",
-  "opencode-go/deepseek-v4-flash",
+  // Qwen3.8 Flash remains available outside the worker harness, but its Go
+  // Messages endpoint currently returns HTTP 500 for tool-enabled turns.
+  "opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4-flash",
 ]);
 
 const SCHEMA = `
@@ -95,7 +96,7 @@ function transaction(action) {
   catch (error) { try { connection.exec("ROLLBACK"); } catch {} throw error; }
 }
 function normalizeBudget(budget) {
-  const maxRequests = safeInteger(Number(budget?.maxRequests ?? budget?.max_requests), "maxRequests", { min: 1, max: 5 });
+  const maxRequests = safeInteger(Number(budget?.maxRequests ?? budget?.max_requests), "maxRequests", { min: 1, max: 8 });
   const totalCost = safeInteger(Number(budget?.totalCostMicrousd ?? budget?.total_cost_microusd), "totalCostMicrousd", { min: 1 });
   const derivedRequestCost = Math.ceil(totalCost / maxRequests);
   const suppliedRequestCost = budget?.requestCostMicrousd ?? budget?.request_cost_microusd;
@@ -180,6 +181,29 @@ function validateAllowance(connection, allowance) {
   return { modelId, normalizedUsd, tariffUsd };
 }
 
+function reconcileClosedAllowanceClaims(connection) {
+  const rows = connection.prepare(`SELECT c.job_id,c.normalized_usd,c.tariff_usd
+    FROM router_allowance_claims c JOIN router_jobs j USING(job_id)
+    WHERE j.state<>'active'`).all();
+  const totals = connection.prepare(`SELECT COALESCE(SUM(
+    CASE WHEN actual_cost_microusd IS NOT NULL THEN actual_cost_microusd
+         ELSE reserved_cost_microusd END),0) charged_cost_microusd
+    FROM router_requests WHERE job_id=?`);
+  const update = connection.prepare("UPDATE router_allowance_claims SET normalized_usd=?,tariff_usd=? WHERE job_id=?");
+  for (const row of rows) {
+    const reservedNormalized = finite(Number(row.normalized_usd), "normalized allowance history");
+    const reservedTariff = finite(Number(row.tariff_usd), "tariff allowance history");
+    if (reservedTariff === 0) {
+      if (reservedNormalized !== 0) throw new Error("Invalid worker normalized allowance history");
+      continue;
+    }
+    const chargedMicrousd = safeInteger(Number(totals.get(row.job_id).charged_cost_microusd), "charged worker cost");
+    const chargedTariff = chargedMicrousd / 1_000_000;
+    const chargedNormalized = chargedTariff * reservedNormalized / reservedTariff;
+    update.run(chargedNormalized, chargedTariff, row.job_id);
+  }
+}
+
 export function createWorkerLease({ jobId, route, budget, metadata = {}, ttlMs = 10 * 60 * 1000, policy, runtimeSha256, allowance, approvedFileCount, approvedCommandCount, allowsEdits }) {
   identifier(jobId, "job id");
   if (typeof route !== "string" || !/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/.test(route)) throw new Error("Invalid exact worker route");
@@ -210,6 +234,7 @@ export function createWorkerLease({ jobId, route, budget, metadata = {}, ttlMs =
     const priorTurn = connection.prepare("SELECT coordinator_model,coordinator_reasoning FROM router_turns WHERE task_id=? AND turn_id=?").get(m.taskId, m.turnId);
     if (priorTurn && (priorTurn.coordinator_model !== m.coordinatorModel || priorTurn.coordinator_reasoning !== m.coordinatorReasoning)) throw new Error("Coordinator identity is locked for the turn");
     if (connection.prepare("SELECT 1 FROM router_jobs WHERE job_id=?").get(jobId)) throw new Error("Worker job already exists; its capability cannot be reissued");
+    reconcileClosedAllowanceClaims(connection);
     const claim = validateAllowance(connection, allowance);
     const created = now();
     connection.prepare("INSERT OR IGNORE INTO router_turns VALUES (?,?,?,?)").run(m.taskId, m.turnId, m.coordinatorModel, m.coordinatorReasoning);
@@ -317,6 +342,27 @@ export function settleWorkerAttempt({ jobId, requestId, status, usage = undefine
   if (deferredError) throw deferredError;
   return result;
 }
+export function fillCertificationBudget({ capability, jobId, route }) {
+  identifier(jobId, "job id");
+  const connection = db();
+  const admission = connection.prepare("SELECT policy_json FROM router_admissions WHERE job_id=?").get(jobId);
+  let policy;
+  try { policy = admission ? JSON.parse(admission.policy_json) : null; } catch { policy = null; }
+  if (!policy || policy.purpose !== "certification") throw new Error("Budget fill is certification-only");
+  let status = workerLeaseStatus(jobId);
+  if (status.state !== "active" || status.route !== route) throw new Error("Certification worker is not active");
+  for (let index = status.requestCount; index < status.budget.maxRequests; index++) {
+    const requestId = `${jobId}:budget-fill:${index}`;
+    const reservation = reserveWorkerAttempt({ capability, jobId, route, requestId, kind: "retry" });
+    if (!reservation.ok) throw new Error(`Certification budget fill failed: ${reservation.reason}`);
+    settleWorkerAttempt({ jobId, requestId, status: "completed",
+      usage: { inputTokens: 0, outputTokens: 0, costMicrousd: 0 } });
+  }
+  status = workerLeaseStatus(jobId);
+  if (status.requestCount !== status.budget.maxRequests) throw new Error("Certification budget was not exhausted");
+  return status;
+}
+
 export function closeWorkerLease({ jobId, outcome = "finished", accepted = null, reviewMinutes = null }) {
   return transaction((connection) => {
     const row = leaseRow(connection, jobId);
@@ -334,6 +380,7 @@ export function closeWorkerLease({ jobId, outcome = "finished", accepted = null,
     const timestamp = now();
     connection.prepare("UPDATE router_jobs SET state=?,finished_utc=?,accepted=?,review_minutes=? WHERE job_id=? AND state='active'").run(jobState, timestamp, acceptedValue, review, jobId);
     connection.prepare("UPDATE router_worker_leases SET state=?,closed_utc=? WHERE job_id=? AND state NOT IN ('finished','failed')").run(leaseState, timestamp, jobId);
+    reconcileClosedAllowanceClaims(connection);
   });
 }
 export function workerLeaseStatus(jobId) {

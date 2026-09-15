@@ -172,3 +172,29 @@ test("finish retries are idempotent but cannot rewrite the outcome", () => {
   leases.closeWorkerLease({jobId: created.jobId, outcome: "completed", accepted: true, reviewMinutes: 2});
   assert.throws(() => leases.closeWorkerLease({jobId: created.jobId, outcome: "failed", accepted: false, reviewMinutes: 2}), /Conflicting/);
 });
+
+test("closing a lease releases unused allowance but retains unknown cost reservations", () => {
+  const created = create("job-allowance-release");
+  leases.reserveWorkerAttempt({capability: created.capability, jobId: created.jobId, route: created.route,
+    requestId: "request-1", kind: "initial"});
+  leases.settleWorkerAttempt({jobId: created.jobId, requestId: "request-1", status: "completed",
+    usage: {inputTokens: 2, outputTokens: 1}});
+  leases.closeWorkerLease({jobId: created.jobId, outcome: "completed", accepted: false, reviewMinutes: 0});
+  const check = new DatabaseSync(process.env.CODEX_WORKER_LEDGER_PATH, {readOnly: true});
+  const claim = check.prepare("SELECT normalized_usd,tariff_usd FROM router_allowance_claims WHERE job_id=?").get(created.jobId);
+  check.close();
+  assert.equal(claim.tariff_usd, 0.0001);
+  assert.ok(Math.abs(claim.normalized_usd - 0.001) < 1e-12);
+});
+
+test("closing a no-request lease releases its entire allowance reservation", () => {
+  const created = create("job-empty-allowance-release");
+  leases.closeWorkerLease({jobId: created.jobId, outcome: "failed", accepted: false, reviewMinutes: 0});
+  const check = new DatabaseSync(process.env.CODEX_WORKER_LEDGER_PATH, {readOnly: true});
+  const claim = check.prepare("SELECT normalized_usd,tariff_usd FROM router_allowance_claims WHERE job_id=?").get(created.jobId);
+  check.close();
+  assert.equal(claim.tariff_usd, 0);
+  assert.equal(claim.normalized_usd, 0);
+  const next = create("job-after-empty-release");
+  assert.equal(next.jobId, "job-after-empty-release");
+});
