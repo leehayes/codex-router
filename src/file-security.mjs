@@ -12,6 +12,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+const WINDOWS_PRIVATE_SYNC_TIMEOUT_MS = 15_000;
+const WINDOWS_PRIVATE_SYNC_RETRY_TIMEOUT_MS = 60_000;
 const WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS = 30_000;
 const WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT = 64 * 1024;
 
@@ -166,31 +168,38 @@ function terminateWindowsChild(child) {
 // fix would succeed, so they are not part of the hardening assertion.
 function protectPrivateFilesWin32(paths) {
   const list = [...paths];
-  try {
-    execFileSync(
-      "powershell.exe",
-      powershellPrivateCommandArgs(),
-      {
-        env: windowsPowerShellEnvironment(list),
-        stdio: ["ignore", "ignore", "pipe"],
-        timeout: 15_000,
-        // Every private write reaches this helper, including the ones a
-        // Control Center status refresh performs. A console child of a GUI
-        // parent gets its own window unless this is set, which is how a
-        // routine refresh produced a burst of visible PowerShell windows
-        // (issue #565). The script is non-interactive and its stdio is
-        // already redirected, so nothing is hidden from the operator.
-        windowsHide: true,
-      },
-    );
-  } catch (error) {
+  let error;
+  for (const timeout of [WINDOWS_PRIVATE_SYNC_TIMEOUT_MS, WINDOWS_PRIVATE_SYNC_RETRY_TIMEOUT_MS]) {
+    try {
+      execFileSync(
+        "powershell.exe",
+        powershellPrivateCommandArgs(),
+        {
+          env: windowsPowerShellEnvironment(list),
+          stdio: ["ignore", "ignore", "pipe"],
+          timeout,
+          // Every private write reaches this helper, including the ones a
+          // Control Center status refresh performs. A console child of a GUI
+          // parent gets its own window unless this is set, which is how a
+          // routine refresh produced a burst of visible PowerShell windows
+          // (issue #565). The script is non-interactive and its stdio is
+          // already redirected, so nothing is hidden from the operator.
+          windowsHide: true,
+        },
+      );
+      return list;
+    } catch (cause) {
+      error = cause;
+      if (cause?.code !== "ETIMEDOUT") break;
+    }
+  }
+  {
     // The hardening script writes its diagnosis to stderr before exiting 1. A
     // non-zero exit is swallowed by execFileSync's throw, so fold the message
     // in here instead of discarding it: a `doctor` report needs it.
     const detail = String(error?.stderr?.trim?.() || error?.message || "").trim();
     throw new Error(detail ? `Failed to protect private file ACL: ${detail}` : `Failed to protect private file ACL.`);
   }
-  return list;
 }
 
 // The request-path writer is asynchronous, but it must use the same bounded
@@ -367,7 +376,7 @@ export function ensureCheckoutReadable(checkoutPath) {
       {
         env: { ...process.env, CODEX_ROUTER_CHECKOUT_PATH: checkoutPath },
         stdio: ["ignore", "ignore", "pipe"],
-        timeout: 15_000,
+        timeout: WINDOWS_PRIVATE_SYNC_TIMEOUT_MS,
         windowsHide: true,
       },
     );
@@ -407,7 +416,7 @@ export function privateFileIsProtected(target) {
         encoding: "utf8",
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "pipe", "ignore"],
-        timeout: 15_000,
+        timeout: WINDOWS_PRIVATE_SYNC_TIMEOUT_MS,
         // Verification runs from the same GUI-parented paths as the write
         // above; see issue #565.
         windowsHide: true,

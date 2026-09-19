@@ -445,7 +445,8 @@ test("Windows installTask registers a minute heartbeat beside logon", () => {
     /New-ScheduledTaskTrigger -Once -At \(Get-Date\) -RepetitionInterval \(New-TimeSpan -Minutes 1\)/,
   );
   assert.match(install, /-Trigger @\(\$logon, \$heartbeat\)/);
-  assert.match(install, /-MultipleInstances IgnoreNew -StartWhenAvailable/);
+  assert.match(install, /-MultipleInstances IgnoreNew[\s\S]*-StartWhenAvailable/);
+  assert.match(install, /-Priority 4/);
 });
 
 test("Windows explicit stop disables heartbeat while start and restart re-enable it", () => {

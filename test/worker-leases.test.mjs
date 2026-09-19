@@ -154,6 +154,15 @@ test("production leases accept an explicit request budget above the old five-req
   assert.equal(created.budget.maxRequests, 10);
 });
 
+test("local allowance estimates are recorded but never veto a production lease", () => {
+  const created = leases.createWorkerLease({jobId: "job-provider-authoritative", route: "opencode-go/mimo-v2.5",
+    budget, metadata, policy: {risk: "low"}, runtimeSha256: "b".repeat(64),
+    allowance: {modelId: "mimo-v2.5", normalizedUsd: 1000, tariffUsd: 1000,
+      monthlyAllowanceUsd: 1, safetyThreshold: 1},
+    approvedFileCount: 2, approvedCommandCount: 1, allowsEdits: true});
+  assert.equal(created.jobId, "job-provider-authoritative");
+});
+
 test("request budgets retain a finite abuse ceiling", () => {
   const excessiveBudget = {
     maxRequests: 101, requestInputTokens: 1000, requestOutputTokens: 500,

@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 // cannot. `spawn` is injectable so tests can stub it without forking.
 export function venvRuntimeProblem(
   python,
-  { spawn = spawnSync, timeoutMs = 15_000, retryTimeoutMs = 45_000 } = {},
+  { spawn = spawnSync, timeoutMs = 15_000, retryTimeoutMs = 120_000 } = {},
 ) {
   const options = {
     encoding: "utf8",

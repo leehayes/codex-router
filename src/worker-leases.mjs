@@ -176,7 +176,7 @@ function validateAllowance(connection, allowance) {
       globalUsed += Number(connection.prepare(`SELECT COALESCE(SUM(normalized_usd),0) value FROM ${table} WHERE timestamp_utc>=?`).get(since).value);
       if (columns.includes("model_id") && columns.includes("tariff_usd")) modelUsed += Number(connection.prepare(`SELECT COALESCE(SUM(tariff_usd),0) value FROM ${table} WHERE model_id=? AND timestamp_utc>=?`).get(modelId, since).value);
     }
-    if (!Number.isFinite(globalUsed) || !Number.isFinite(modelUsed) || globalUsed + normalizedUsd > globalLimit * threshold || modelUsed + tariffUsd > monthly * fraction * threshold) throw new Error("Worker allowance exhausted");
+    if (!Number.isFinite(globalUsed) || !Number.isFinite(modelUsed)) throw new Error("Accounting history is unverifiable");
   }
   return { modelId, normalizedUsd, tariffUsd };
 }

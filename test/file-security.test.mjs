@@ -29,6 +29,9 @@ test("the Windows async ACL path uses the bounded one-shot script", () => {
   assert.match(implementation, /treeKiller\.unref/);
   assert.doesNotMatch(implementation, /execFileSync\(\s*\n?\s*"taskkill\.exe"/);
   assert.match(implementation, /WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS/);
+  assert.match(implementation, /WINDOWS_PRIVATE_SYNC_TIMEOUT_MS = 15_000/);
+  assert.match(implementation, /WINDOWS_PRIVATE_SYNC_RETRY_TIMEOUT_MS = 60_000/);
+  assert.match(implementation, /cause\?\.code !== "ETIMEDOUT"/);
   assert.doesNotMatch(implementation, /powershellPrivateWorkerScript/);
 });
 

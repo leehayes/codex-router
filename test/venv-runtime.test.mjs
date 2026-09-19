@@ -49,7 +49,7 @@ test("a transient interpreter timeout is retried with a wider hard bound", () =>
   };
 
   assert.equal(venvRuntimeProblem("python", { spawn }), undefined);
-  assert.deepEqual(timeouts, [15_000, 45_000]);
+  assert.deepEqual(timeouts, [15_000, 120_000]);
 });
 
 test("a persistent interpreter timeout is not called permanent venv corruption", () => {
@@ -68,7 +68,7 @@ test("a persistent interpreter timeout is not called permanent venv corruption",
   });
 
   assert.equal(calls, 2);
-  assert.match(problem, /timed out after 45000 ms/);
+  assert.match(problem, /timed out after 120000 ms/);
   assert.match(problem, /transient/i);
   assert.match(problem, /not proof of a broken virtual environment/i);
 });
