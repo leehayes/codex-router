@@ -141,6 +141,31 @@ test("request count budget is enforced before forwarding", () => {
   assert.equal(status.budgetDeniedRequests, 1);
 });
 
+test("production leases accept an explicit request budget above the old five-request ceiling", () => {
+  const extendedBudget = {
+    maxRequests: 10, requestInputTokens: 1000, requestOutputTokens: 500,
+    totalTokens: 15000, totalCostMicrousd: 1000, requestCostMicrousd: 100,
+  };
+  const created = leases.createWorkerLease({jobId: "job-extended-budget", route: "opencode-go/mimo-v2.5",
+    budget: extendedBudget, metadata, policy: {risk: "low"}, runtimeSha256: "b".repeat(64),
+    allowance: {modelId: "mimo-v2.5", normalizedUsd: 0.01, tariffUsd: 0.001,
+      monthlyAllowanceUsd: 60, safetyThreshold: 1},
+    approvedFileCount: 2, approvedCommandCount: 1, allowsEdits: true});
+  assert.equal(created.budget.maxRequests, 10);
+});
+
+test("request budgets retain a finite abuse ceiling", () => {
+  const excessiveBudget = {
+    maxRequests: 101, requestInputTokens: 1000, requestOutputTokens: 500,
+    totalTokens: 151500, totalCostMicrousd: 10100, requestCostMicrousd: 100,
+  };
+  assert.throws(() => leases.createWorkerLease({jobId: "job-excessive-budget", route: "opencode-go/mimo-v2.5",
+    budget: excessiveBudget, metadata, policy: {risk: "low"}, runtimeSha256: "b".repeat(64),
+    allowance: {modelId: "mimo-v2.5", normalizedUsd: 0.01, tariffUsd: 0.001,
+      monthlyAllowanceUsd: 60, safetyThreshold: 1},
+    approvedFileCount: 2, approvedCommandCount: 1, allowsEdits: true}), /maxRequests/);
+});
+
 test("a lease with a pending attempt cannot be closed", () => {
   const created = create("job-pending");
   leases.reserveWorkerAttempt({capability: created.capability, jobId: created.jobId, route: created.route,

@@ -96,7 +96,7 @@ function transaction(action) {
   catch (error) { try { connection.exec("ROLLBACK"); } catch {} throw error; }
 }
 function normalizeBudget(budget) {
-  const maxRequests = safeInteger(Number(budget?.maxRequests ?? budget?.max_requests), "maxRequests", { min: 1, max: 8 });
+  const maxRequests = safeInteger(Number(budget?.maxRequests ?? budget?.max_requests), "maxRequests", { min: 1, max: 100 });
   const totalCost = safeInteger(Number(budget?.totalCostMicrousd ?? budget?.total_cost_microusd), "totalCostMicrousd", { min: 1 });
   const derivedRequestCost = Math.ceil(totalCost / maxRequests);
   const suppliedRequestCost = budget?.requestCostMicrousd ?? budget?.request_cost_microusd;
