@@ -12,11 +12,9 @@ const MAX_REQUEST_INPUT = 32768;
 const MAX_REQUEST_OUTPUT = 8000;
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const CERTIFICATION_ROUTES = new Set([
-  "opencode-go-messages/minimax-m3", "opencode-go/mimo-v2.5",
-  "opencode-go-responses/grok-4.6", "opencode-go/kimi-k2.7-code",
-  // Qwen3.8 Flash remains available outside the worker harness, but its Go
-  // Messages endpoint currently returns HTTP 500 for tool-enabled turns.
-  "opencode-go/glm-5.3-flash", "opencode-go/deepseek-v4-flash",
+    "opencode-go-messages/minimax-m3", "opencode-go/mimo-v2.5",
+  "opencode-go/glm-5.3-flash", "opencode-go-responses/grok-4.6",
+  "opencode-go/kimi-k3",
 ]);
 
 const SCHEMA = `

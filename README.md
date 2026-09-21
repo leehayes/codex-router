@@ -1847,10 +1847,13 @@ replays assistant output back as input, so a note from the router would come
 back next turn as a sentence the model thinks it wrote.
 
 Compaction gets the same treatment: a compaction that cannot run ends a long
-session just as surely as a turn that cannot run.
-
-Note: your signed-in ChatGPT plan is **not** currently used as a fallback tier.
-Routed models fall back to other routed models only.
+session just as surely as a turn that cannot run. Once every eligible routed
+model has returned a definite allowance/rate-limit failure, signed coexistence
+replays the request through the authenticated native Codex session. The native
+fallback model is the configured router default, then GPT-5.6 Luna, then the
+native relay default; set `MODEL_ROUTER_NATIVE_FALLBACK_MODEL` to make the
+choice explicit. Ambiguous network, credential and malformed-request failures
+still remain on the original route.
 
 ## Make models appear in DeepSeek Harness
 

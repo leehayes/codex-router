@@ -166,6 +166,59 @@ test("router health waits for enabled dependencies and ignores disabled forwarde
   }
 });
 
+test("private worker-control readiness is authenticated and performs no provider forwarding", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "worker-control-ready-"));
+  writeFileSync(
+    path.join(testRoot, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["kimi-oauth"] })}\n`,
+    { mode: 0o600 },
+  );
+  const upstreamRequests = [];
+  const healthy = await mockServer((request, response) => {
+    upstreamRequests.push(request.url);
+    json(response, 200, { ok: true, credential_present: true });
+  });
+  const routerPort = await openPort();
+  const workerAdminKey = "test-worker-admin-capability-with-sufficient-length";
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: testRoot,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "0",
+    CODEX_ROUTER_WORKER_ADMIN_KEY: workerAdminKey,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, router);
+    const endpoint = `http://127.0.0.1:${routerPort}/_codex-router/worker-control/ready`;
+    const unauthorized = await fetch(endpoint);
+    assert.equal(unauthorized.status, 401);
+    const before = upstreamRequests.length;
+    const response = await fetch(endpoint, {
+      headers: { Authorization: `Bearer ${workerAdminKey}` },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      result: {
+        ready: true,
+        authenticated: true,
+        providerForwarding: false,
+        controlVersion: 1,
+      },
+    });
+    assert.equal(upstreamRequests.length, before);
+  } finally {
+    await stopChild(router);
+    await closeServer(healthy.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 // The Grok OAuth forwarder listens on its own port and was the one forwarder
 // nothing probed, so the router could answer `ok` with it dead (#366). It is
 // gated on the provider the way the Kimi OAuth forwarder is, because probing a

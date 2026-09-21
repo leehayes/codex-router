@@ -117,6 +117,7 @@ import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { nativeContextVariantBase } from "./native-context-variants.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
+import { readCodexRouterDefault } from "./codex-default-model.mjs";
 import {
   executeSearchSidecar,
   SearchSidecarError,
@@ -1534,6 +1535,83 @@ function nativeAgentRelayModel() {
   }
 }
 
+// A routed request carries the OpenCode slug, not the native picker value that
+// would have been selected had the turn stayed on Codex. When a definite Go
+// allowance failure leaves no external route, use the router's configured
+// native default if it is a real native catalog entry, then prefer Luna (the
+// normal reserve/workhorse) and finally the existing agent relay choice. This
+// is intentionally explicit and local: it never guesses a provider slug or
+// forwards an OpenCode identifier to chatgpt.com.
+function nativeFallbackModel() {
+  const catalog = (() => {
+    try {
+      const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
+      return Array.isArray(parsed?.models) ? parsed.models : [];
+    } catch {
+      return [];
+    }
+  })();
+  const nativeSlugs = new Set(
+    catalog
+      .map((model) => model?.slug)
+      .filter((slug) => typeof slug === "string" && slug && !slug.includes("/")),
+  );
+  const configured = [];
+  const envModel = String(process.env.MODEL_ROUTER_NATIVE_FALLBACK_MODEL || "").trim();
+  if (envModel) configured.push(envModel);
+  try {
+    const state = readCodexRouterDefault();
+    if (state?.model) configured.push(state.model);
+  } catch {
+    // A damaged optional default must not prevent native fallback.
+  }
+  configured.push("gpt-5.6-luna", nativeAgentRelayModel(), "gpt-5.6-sol");
+  return configured.find((slug) => nativeSlugs.has(slug)) ||
+    [...nativeSlugs][0] || "gpt-5.6-sol";
+}
+
+async function prepareNativeFallbackRequest({ request, payload, requestUrl, compactV1, compactV2 }) {
+  const native = { ...payload, model: nativeFallbackModel() };
+  const substitutedCaller = callerBroughtNoUpstreamCredential(request);
+  const toolResultAging = { toolResultsAged: 0, toolResultBytesSaved: 0 };
+  let pendingInterrupts = [];
+  let flattenedNamespaces = new Map();
+  if (Array.isArray(payload.input)) {
+    native.input = normalizeNativeInput(payload.input, {
+      statelessReasoning: substitutedCaller,
+      dropUnstoredReasoningReferences: substitutedCaller && !compactV1,
+    });
+    if (!compactV1 && !compactV2) {
+      const aged = ageToolResults(native.input, { enabled: nativeToolResultAgingEnabled() });
+      native.input = aged.input;
+      Object.assign(toolResultAging, aged.stats);
+    }
+  }
+  flattenedNamespaces = flattenNamespaceTools(payload.tools, { bridgeToolSearch: false }).namespaces;
+  pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
+    namespaces: flattenedNamespaces,
+  });
+  if (!compactV1) delete native.previous_response_id;
+  if (substitutedCaller) normalizeNativeForSubstitutedCaller(native, { compact: compactV1 });
+  const headers = nativeHeaders(request);
+  // A routed OpenCode request may carry the router caller key (or another
+  // provider credential), neither of which is a ChatGPT session. Prefer the
+  // explicitly authorized native session for this cross-provider retry so a
+  // provider key can never leak to chatgpt.com.
+  const fallbackSession = nativeSessionHeaders();
+  if (fallbackSession) Object.assign(headers, fallbackSession);
+  const body = await compressedNativeBody(Buffer.from(JSON.stringify(native), "utf8"), headers);
+  return {
+    model: native.model,
+    target: nativeTarget(requestUrl.pathname, nativeRequestSearch(requestUrl)),
+    headers,
+    body,
+    pendingInterrupts,
+    flattenedNamespaces,
+    toolResultAging,
+  };
+}
+
 // Every `encrypted_content` value OpenAI issues is a Fernet token: the version
 // byte 0x80 followed by a big-endian timestamp whose leading bytes stay zero
 // for the rest of the century, which base64url-encodes to the fixed `gAAAAA`
@@ -2786,7 +2864,46 @@ async function summarizeWith(
   return { upstream, bridged, bytes: Buffer.byteLength(serialized, "utf8"), workerAttemptId: compactRequestId };
 }
 
-async function summarize(request, payload, route, signal, { allowFailover = true } = {}) {
+// Last-resort compaction fallback. This uses the router's authenticated native
+// Codex session only after a routed provider returned a definite allowance or
+// rate-limit verdict. Ambiguous, malformed and credential failures never enter
+// this path.
+async function summarizeWithNative(request, payload, aged, prepared, signal, requestUrl, compactV1, compactV2) {
+  if (!nativeSessionHeaders()) return undefined;
+  const built = await prepareNativeFallbackRequest({
+    request,
+    payload: {
+      ...payload,
+      input: [
+        ...aged.input,
+        messageItem(prepared.catalogText),
+        messageItem(COMPACTION_PROMPT),
+      ],
+    },
+    requestUrl,
+    compactV1,
+    compactV2,
+  });
+  const upstream = await fetch(built.target, {
+    method: "POST",
+    headers: built.headers,
+    body: built.body,
+    signal,
+  });
+  const bytes = await readResponseBody(upstream, {
+    maxBytes: 32 * 1024 * 1024,
+    signal,
+  });
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    parsed = undefined;
+  }
+  return { upstream, parsed, route: { slug: built.model, provider: "openai" } };
+}
+
+async function summarize(request, payload, route, signal, requestUrl, { allowFailover = true } = {}) {
   // The conversation's selected route owns the capability contract. Resolve
   // it before normalization so a fallback cannot add back ambient search that
   // the selected model never advertised. Compaction itself sends no tools or
@@ -2830,6 +2947,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
   // Attempts that were sent and rejected, kept so the caller can meter each one.
   const failed = [];
   let last;
+  let lastSwapReason;
   for (let index = 0; index < attempts.length; index += 1) {
     const attemptRoute = attempts[index];
     if (
@@ -2947,6 +3065,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
       bodyText: bytes.toString("utf8"),
       retryAfterSeconds: retryAfterSeconds(sent.upstream.headers),
     });
+    lastSwapReason = verdict.swap ? verdict.reason : undefined;
     if (!allowFailover) return { ...last, failed };
     if (!verdict.swap) return { ...last, failed };
     recordProviderCooldown(attemptRoute.provider, verdict);
@@ -2959,6 +3078,35 @@ async function summarize(request, payload, route, signal, { allowFailover = true
         "retrying",
       );
     }
+  }
+  if (last && lastSwapReason && allowFailover && requestUrl && nativeSessionHeaders()) {
+    const compactV1 = requestUrl.pathname.endsWith("/responses/compact");
+    const native = await summarizeWithNative(
+      request,
+      payload,
+      aged,
+      prepared,
+      signal,
+      requestUrl,
+      compactV1,
+      !compactV1,
+    );
+    if (native?.parsed && native.upstream.ok) {
+      logFailover(route, native.route, `compaction/${lastSwapReason}`, last.status, native.upstream.status);
+      const usage = tokenUsageFromPayload(native.parsed);
+      return {
+        ok: true,
+        checkpoint: finalizeCheckpoint(extractResponseText(native.parsed), prepared),
+        input: originalInput,
+        usage,
+        toolResultAging: aged.stats,
+        route: native.route,
+        failed,
+        failoverFrom: route.slug,
+      };
+    }
+    logFailover(route, native?.route, `compaction/${lastSwapReason}`, last.status,
+      native?.upstream?.status || "native-failed");
   }
   return last && { ...last, failed };
 }
@@ -3035,9 +3183,10 @@ async function handleRoutedCompaction(
   route,
   signal,
   v2,
+  requestUrl,
   { allowFailover = true } = {},
 ) {
-  const result = await summarize(request, payload, route, signal, { allowFailover });
+  const result = await summarize(request, payload, route, signal, requestUrl, { allowFailover });
   // A compaction moved to another model is metered against the model that
   // actually produced the summary, the same as any other turn.
   const served = {
@@ -3930,6 +4079,7 @@ async function handleResponses(request, response, requestUrl) {
   const diagnostics = { requestId: activity.requestId };
   let clientGone = false;
   let requestedModel = "";
+  let servedModel = "";
   let route;
   let upstreamRetries;
   let upstreamStatus;
@@ -4063,6 +4213,7 @@ async function handleResponses(request, response, requestUrl) {
         route,
         controller.signal,
         compactV2,
+        requestUrl,
         { allowFailover: !exactRouteProbe && !request.codexRouterWorkerCapability },
       );
       const compacted = compaction.route || route;
@@ -4127,6 +4278,24 @@ async function handleResponses(request, response, requestUrl) {
       activity.setRoute({
         provider: canonicalProviderId(route.provider),
         model: route.slug,
+        ...activityMetadataFromHeaders(request.headers),
+      });
+    };
+    const adoptNative = (built) => {
+      failoverFrom ??= route?.slug;
+      servedModel = built.model;
+      route = undefined;
+      namespacesFlattened = false;
+      flattenedNamespaces = built.flattenedNamespaces;
+      pendingInterrupts = built.pendingInterrupts;
+      toolResultAging = built.toolResultAging;
+      target = built.target;
+      headers = built.headers;
+      routedBody = built.body;
+      builtSearchMode = undefined;
+      activity.setRoute({
+        provider: "openai",
+        model: built.model,
         ...activityMetadataFromHeaders(request.headers),
       });
     };
@@ -4395,6 +4564,7 @@ async function handleResponses(request, response, requestUrl) {
           agingEnabled,
           searchContract,
         });
+        let nativeMoved = false;
         if (moved) {
           // The attempt that failed is still a turn that happened and still
           // cost the provider something, so it is metered on its own row. The
@@ -4411,7 +4581,77 @@ async function handleResponses(request, response, requestUrl) {
           upstream = moved.upstream;
           upstreamStatus = upstream.status;
           failedBodyText = moved.failedBodyText;
+        } else if (
+          verdict.swap &&
+          ["out_of_usage", "rate_limited"].includes(verdict.reason) &&
+          nativeSessionHeaders()
+        ) {
+          // OpenCode has definitively exhausted or rate-limited its allowance.
+          // Once every eligible OpenCode hop has been tried, replay the same
+          // request through the authenticated native Codex session before
+          // exposing the provider error to the user.
+          try {
+            const failedRoute = route;
+            const nativeBuilt = await prepareNativeFallbackRequest({
+              request,
+              payload,
+              requestUrl,
+              compactV1: false,
+              compactV2: false,
+            });
+            const nativeAttempt = await fetchWithRetry(
+              nativeBuilt.target,
+              {
+                method: "POST",
+                headers: nativeBuilt.headers,
+                body: nativeBuilt.body,
+                signal: controller.signal,
+              },
+              {
+                retries: 0,
+                canRetry: () => nothingRelayed(response),
+                onRetry: (event) => logUpstreamRetry(event, nativeBuilt.model, requestUrl.pathname),
+              },
+            );
+            if (nativeAttempt.response.ok) {
+              const failedStatus = upstream.status;
+              recordObservedUsage({
+                model: route.slug,
+                provider: canonicalProviderId(route.provider),
+                status: failedStatus,
+                durationMs: Date.now() - startedAt,
+                responseStartMs: upstreamLatencyMs,
+                failoverToNative: true,
+              }, diagnostics);
+              adoptNative(nativeBuilt);
+              upstream = nativeAttempt.response;
+              upstreamRetries = (upstreamRetries || 0) + (nativeAttempt.retries || 0);
+              upstreamStatus = upstream.status;
+              upstreamLatencyMs = Date.now() - startedAt;
+              failedBodyText = undefined;
+              nativeMoved = true;
+              logFailover(
+                failedRoute,
+                { slug: nativeBuilt.model },
+                verdict.reason,
+                failedStatus,
+                nativeAttempt.response.status,
+              );
+            }
+          } catch (error) {
+            if (!controller.signal.aborted && !QUIET) {
+              console.error(`[codex-router] native fallback failed model=${nativeFallbackModel()} error=${error?.name || "Error"}`);
+            }
+          }
         } else {
+          // No candidate took the turn, so the failure reported below is the
+          // original route's; undo any candidate the failover loop named.
+          activity.progress.setRoute({
+            provider: canonicalProviderId(route.provider),
+            model: route.slug,
+          });
+        }
+        if (!moved && !nativeMoved && verdict.swap) {
           // No candidate took the turn, so the failure reported below is the
           // original route's; undo any candidate the failover loop named.
           activity.progress.setRoute({
@@ -4939,7 +5179,7 @@ async function handleResponses(request, response, requestUrl) {
     // A cancel is not a router failure, so it meters as 0 rather than the
     // committed 200 that the client never finished reading.
     recordObservedUsage({
-      model: route?.slug || requestedModel,
+      model: route?.slug || servedModel || requestedModel,
       provider: route ? canonicalProviderId(route.provider) : "openai",
       status: finalStatus,
       durationMs: Date.now() - startedAt,
@@ -4975,7 +5215,7 @@ async function handleResponses(request, response, requestUrl) {
       // The substitution is named in the log line as well as the usage event:
       // a router that quietly invents token counts is its own trap.
       console.error(
-        `[codex-router] model=${route?.slug || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${finalStatus}${
+        `[codex-router] model=${route?.slug || servedModel || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${finalStatus}${
           upstreamRetries ? ` retries=${upstreamRetries}` : ""
         }${estimatedInputTokens ? ` estimated-input-tokens=${estimatedInputTokens}` : ""}${
           toolResultAging?.toolResultBytesSaved
@@ -5202,7 +5442,7 @@ async function handleResponses(request, response, requestUrl) {
     // the other way round (the asked-for model beside the serving provider)
     // describes a combination that never ran.
     console.error(
-      `[codex-router] timing at=${new Date().toISOString()} model=${route?.slug || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${status} total_ms=${Date.now() - startedAt} upstream_ms=${timingMetric(upstreamLatencyMs)} out_tokens=${timingMetric(usage?.outputTokens)} cached_tokens=${timingMetric(usage?.cachedInputTokens)}${
+      `[codex-router] timing at=${new Date().toISOString()} model=${route?.slug || servedModel || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${status} total_ms=${Date.now() - startedAt} upstream_ms=${timingMetric(upstreamLatencyMs)} out_tokens=${timingMetric(usage?.outputTokens)} cached_tokens=${timingMetric(usage?.cachedInputTokens)}${
         estimatedInputTokens ? ` est_input=${estimatedInputTokens}` : ""
       }${failoverFrom ? ` failover_from=${failoverFrom}` : ""}`,
     );
@@ -5603,6 +5843,20 @@ async function handleRequest(request, response) {
       return;
     }
     const relative = requestUrl.pathname.slice("/_codex-router/worker-control".length);
+    if (request.method === "GET" && relative === "/ready") {
+      // Authenticated control-plane reachability only. This must never inspect
+      // a provider, create a lease, reserve allowance, or forward inference.
+      writeJson(response, 200, {
+        ok: true,
+        result: {
+          ready: true,
+          authenticated: true,
+          providerForwarding: false,
+          controlVersion: 1,
+        },
+      });
+      return;
+    }
     const match = relative.match(/^\/jobs\/([A-Za-z0-9_.:-]{1,160})(?:\/(bind|finish|exhaust))?$/);
     if (request.method === "GET" && match && !match[2]) {
       writeJson(response, 200, workerLeaseStatus(match[1]));
