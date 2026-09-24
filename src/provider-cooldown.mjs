@@ -7,11 +7,20 @@ import { canonicalProviderId } from "./provider-selection.mjs";
 // keeps those stores from drifting back apart under two names for the same
 // subscription.
 //
-// Protocol variants of one subscription share the same upstream allowance.
-// opencode Zen is the exception: it shares a credential and selection toggle
-// with Go, but it uses the separately billed /zen endpoint. Exhausting Go must
-// not disable a route the operator can still pay for through Zen.
-export function cooldownScope(providerId) {
+// Most protocol variants of one subscription share the same upstream
+// allowance. OpenCode Go is narrower: variants of the same model share a
+// cooldown, while independent model allowances stay available. OpenCode Zen
+// is separately billed and therefore keeps its own provider-level scope.
+export function cooldownScope(providerId, modelSlug) {
   if (providerId === "opencode-zen") return providerId;
-  return canonicalProviderId(providerId);
+  const canonical = canonicalProviderId(providerId);
+  // OpenCode Go exposes independent model allowances behind one credential.
+  // Protocol variants share the allowance for the same model, but exhausting
+  // Kimi must not withdraw Grok, DeepSeek, or Luna.
+  if (canonical === "opencode-go" && modelSlug) {
+    const value = String(modelSlug).trim();
+    const model = value.includes("/") ? value.slice(value.indexOf("/") + 1) : value;
+    return `${canonical}::${model}`;
+  }
+  return canonical;
 }

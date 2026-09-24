@@ -174,6 +174,11 @@ export function recordUsageEvent({
   // Router-generated correlation id. Matches /activity's `requestId`. Optional so
   // historical rows keep their exact shape.
   requestId,
+  // Metadata-only correlation for the OpenCode profile ledger. These fields
+  // contain opaque local ids and a model slug, never prompt or response text.
+  sessionId,
+  threadId,
+  requestedProfile,
   // Grok OAuth 4.6 ingress UTF-8 JSON byte split. Optional, bounded, and never
   // a token estimate. Missing payload fields measure as zero.
   contextBytes,
@@ -220,6 +225,15 @@ export function recordUsageEvent({
     ...(safeRetryCount(retries) !== undefined ? { retries: safeRetryCount(retries) } : {}),
     ...(typeof failoverFrom === "string" && failoverFrom.trim()
       ? { failoverFrom: safeText(failoverFrom, "unknown") }
+      : {}),
+    ...(typeof sessionId === "string" && sessionId.trim()
+      ? { sessionId: safeText(sessionId, "unknown") }
+      : {}),
+    ...(typeof threadId === "string" && threadId.trim()
+      ? { threadId: safeText(threadId, "unknown") }
+      : {}),
+    ...(typeof requestedProfile === "string" && requestedProfile.trim()
+      ? { requestedProfile: safeText(requestedProfile, "unknown") }
       : {}),
     ...(searchSidecar === true ? { searchSidecar: true } : {}),
     ...(searchSidecar === true && typeof searchCacheHit === "boolean"
@@ -544,6 +558,15 @@ export function recentUsageEvents({
             ? { emptyCompletionPreludeLimit: event.emptyCompletionPreludeLimit }
             : {}),
           ...(retries !== undefined ? { retries } : {}),
+          ...(typeof event.sessionId === "string" && event.sessionId.trim()
+            ? { sessionId: safeText(event.sessionId, "unknown") }
+            : {}),
+          ...(typeof event.threadId === "string" && event.threadId.trim()
+            ? { threadId: safeText(event.threadId, "unknown") }
+            : {}),
+          ...(typeof event.requestedProfile === "string" && event.requestedProfile.trim()
+            ? { requestedProfile: safeText(event.requestedProfile, "unknown") }
+            : {}),
           ...(event.searchSidecar === true ? { searchSidecar: true } : {}),
           ...(event.searchSidecar === true && typeof event.searchCacheHit === "boolean"
             ? { searchCacheHit: event.searchCacheHit }

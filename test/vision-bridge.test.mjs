@@ -1610,7 +1610,7 @@ test("a bridged read is recorded rather than spent silently", async () => {
 // The list only helps if the read path actually walks it. Asserted against the
 // source because the loop lives inside the request handler, the same way the
 // QUIET and usage-event rules above are asserted.
-test("the router remembers provider quota evidence and skips sibling vision engines", async () => {
+test("the router remembers exact model quota evidence without suppressing sibling vision engines", async () => {
   const source = await readFile(path.join(repoRoot, "src/router.mjs"), "utf8");
   const evidence = source.slice(
     source.indexOf("async function readVisionEvidence"),
@@ -1633,12 +1633,12 @@ test("the router remembers provider quota evidence and skips sibling vision engi
     source.indexOf("async function bridgeVisionInput"),
     source.indexOf("function isOpaqueEncryptedContent"),
   );
-  assert.match(bridge, /const exhaustedProviders = new Set\(\)/);
-  assert.match(bridge, /providerCooldown\(provider\)/);
-  assert.match(bridge, /exhaustedProviders\.has\(provider\)/);
+  assert.match(bridge, /const exhaustedScopes = new Set\(\)/);
+  assert.match(bridge, /providerCooldown\(visionEngineProvider\(engine\), \{ modelSlug: engine\.slug \}\)/);
+  assert.match(bridge, /exhaustedScopes\.has\(scope\)/);
   assert.match(
     bridge,
-    /error\?\.failureKind === "out_of_usage"\) exhaustedProviders\.add\(provider\)/,
+    /error\?\.failureKind === "out_of_usage"\) exhaustedScopes\.add\(scope\)/,
   );
 });
 

@@ -17,6 +17,7 @@ const {
   clearProviderCooldown,
   failoverTier,
   failoverTierCounts,
+  failoverReachableModels,
   providerCooldown,
   rankFailoverCandidates,
   readFailoverSettings,
@@ -424,6 +425,62 @@ test("rankFailoverCandidates never routes back into the same quota", () => {
   );
 });
 
+test("classifyRoutedFailure steps past an OpenCode model disabled behind a healthy account", () => {
+  assert.deepEqual(
+    classifyRoutedFailure({
+      status: 403,
+      bodyText: JSON.stringify({ error: { message: "Upstream request failed: Model access is disabled" } }),
+      now: NOW,
+    }),
+    {
+      swap: true,
+      reason: "model_unavailable",
+      until: new Date(NOW + 5 * 60_000).toISOString(),
+    },
+  );
+});
+
+test("rankFailoverCandidates can cross OpenCode models without crossing subscriptions", () => {
+  const from = model("opencode-go/kimi-k3", "opencode-go");
+  const ranked = rankFailoverCandidates(
+    [
+      from,
+      model("opencode-go-responses/grok-4.6", "opencode-go-responses"),
+      model("opencode-go/deepseek-v4-pro", "opencode-go"),
+    ],
+    { from, chain: ["opencode-go-responses/grok-4.6", "opencode-go/deepseek-v4-pro"] },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["opencode-go-responses/grok-4.6", "opencode-go/deepseek-v4-pro"],
+  );
+});
+
+test("an explicit profile chain can route hidden implementation models", () => {
+  const models = [
+    model("opencode-go/kimi-k3", "opencode-go"),
+    model("opencode-go-responses/grok-4.6", "opencode-go-responses"),
+  ];
+  assert.deepEqual(
+    failoverReachableModels(models, {
+      hidden: new Set(models.map((entry) => entry.slug)),
+      chain: ["opencode-go/kimi-k3"],
+    }).map((entry) => entry.slug),
+    ["opencode-go/kimi-k3"],
+  );
+});
+
+test("an exhausted OpenCode model does not cool its siblings", (t) => {
+  t.after(() => clearAllProviderCooldowns());
+  recordProviderCooldown("opencode-go", {
+    modelSlug: "opencode-go/kimi-k3",
+    until: new Date(NOW + 600_000).toISOString(),
+    now: NOW,
+  });
+  assert.ok(providerCooldown("opencode-go", { modelSlug: "opencode-go/kimi-k3", now: NOW }));
+  assert.equal(providerCooldown("opencode-go", { modelSlug: "opencode-go/grok-4.6", now: NOW }), undefined);
+});
+
 test("rankFailoverCandidates will not trade a quota error for a context error", () => {
   const ranked = rankFailoverCandidates(
     [model("kimi/k3", "kimi", { contextWindow: 262_144 }), model("gemini/g4", "gemini", { contextWindow: 1_048_576 })],
@@ -448,10 +505,11 @@ test("rankFailoverCandidates skips a provider that is already cooled down", (t) 
   );
 });
 
-test("rankFailoverCandidates still offers a separately billed variant", (t) => {
+test("legacy provider-wide Go cooldown does not suppress model-scoped routes", (t) => {
   t.after(() => clearAllProviderCooldowns());
-  // The Go plan is empty. Its protocol variants are empty with it; Zen is a
-  // different bill at a different endpoint and remains a candidate.
+  // Older builds recorded one Go-wide window. Go allowances are model scoped,
+  // so that stale broad record must not remove every model after upgrade. Zen
+  // remains a separate billing endpoint as before.
   recordProviderCooldown("opencode-go", {
     until: new Date(NOW + 600_000).toISOString(),
     now: NOW,
@@ -464,10 +522,11 @@ test("rankFailoverCandidates still offers a separately billed variant", (t) => {
     ],
     { from: FROM, now: NOW },
   );
-  assert.deepEqual(
-    ranked.map((entry) => entry.model.slug),
-    ["opencode-zen/glm-5.3"],
-  );
+  assert.deepEqual(new Set(ranked.map((entry) => entry.model.slug)), new Set([
+    "opencode-go-responses/glm-5.3",
+    "opencode-zen/glm-5.3",
+    "opencode-go/glm-5.3",
+  ]));
 });
 
 test("rankFailoverCandidates keeps a collaboration turn on a v2 model", () => {

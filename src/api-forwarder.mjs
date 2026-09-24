@@ -1261,7 +1261,10 @@ function recordUpstreamLimits(normalized, upstream) {
   // filed Zen's window under the Go plan, so each plan's response overwrote the
   // other's snapshot and neither could be read back under the id that produced
   // it.
-  if (rateLimit) recordRateLimitSnapshot(cooldownScope(normalized.provider.id), rateLimit);
+  if (rateLimit) recordRateLimitSnapshot(
+    cooldownScope(normalized.provider.id, normalized.model?.slug),
+    rateLimit,
+  );
   // This hop is the only place the provider's own status and headers are seen
   // before LiteLLM restates them, so it is the only place a reset time the
   // gateway does not relay can still be read. A failure that names when the
@@ -1279,6 +1282,7 @@ function recordUpstreamLimits(normalized, upstream) {
   recordProviderCooldown(normalized.provider.id, {
     until,
     reason: upstream.status === 429 ? "rate_limited" : "out_of_usage",
+    modelSlug: normalized.model?.slug,
   });
 }
 

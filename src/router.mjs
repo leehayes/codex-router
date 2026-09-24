@@ -182,6 +182,7 @@ import {
   MAX_FAILOVER_HOPS,
   classifyRoutedFailure,
   clearProviderCooldown,
+  failoverReachableModels,
   providerCooldown,
   rankFailoverCandidates,
   readFailoverSettings,
@@ -256,6 +257,10 @@ import {
 } from "./fetch-transport.mjs";
 import { grokStreamStallMs, grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
 import { handleResponsesWebSocketUpgrade } from "./responses-websocket.mjs";
+import {
+  isOpenCodeProfileSlug,
+  resolveOpenCodeProfile,
+} from "./opencode-profiles.mjs";
 
 installStableFetchTransport();
 
@@ -627,6 +632,9 @@ function recordObservedUsage(fields, diagnostics) {
   recordUsageEvent({
     ...fields,
     ...usageDiagnosticMetadata(diagnostics),
+    sessionId: diagnostics?.sessionId,
+    threadId: diagnostics?.threadId,
+    requestedProfile: diagnostics?.requestedProfile,
   });
 }
 
@@ -1542,7 +1550,7 @@ function nativeAgentRelayModel() {
 // normal reserve/workhorse) and finally the existing agent relay choice. This
 // is intentionally explicit and local: it never guesses a provider slug or
 // forwards an OpenCode identifier to chatgpt.com.
-function nativeFallbackModel() {
+function nativeFallbackModel(qualityClass) {
   const catalog = (() => {
     try {
       const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
@@ -1557,6 +1565,12 @@ function nativeFallbackModel() {
       .filter((slug) => typeof slug === "string" && slug && !slug.includes("/")),
   );
   const configured = [];
+  const classCandidates = {
+    workhorse: ["gpt-6-luna", "gpt-5.6-luna"],
+    advanced: ["gpt-6-sol", "gpt-5.6-sol"],
+    premium: ["gpt-6-astra", "gpt-5.6-astra", "gpt-5.5"],
+  };
+  if (classCandidates[qualityClass]) configured.push(...classCandidates[qualityClass]);
   const envModel = String(process.env.MODEL_ROUTER_NATIVE_FALLBACK_MODEL || "").trim();
   if (envModel) configured.push(envModel);
   try {
@@ -1570,8 +1584,8 @@ function nativeFallbackModel() {
     [...nativeSlugs][0] || "gpt-5.6-sol";
 }
 
-async function prepareNativeFallbackRequest({ request, payload, requestUrl, compactV1, compactV2 }) {
-  const native = { ...payload, model: nativeFallbackModel() };
+async function prepareNativeFallbackRequest({ request, payload, requestUrl, compactV1, compactV2, nativeClass }) {
+  const native = { ...payload, model: nativeFallbackModel(nativeClass) };
   const substitutedCaller = callerBroughtNoUpstreamCredential(request);
   const toolResultAging = { toolResultsAged: 0, toolResultBytesSaved: 0 };
   let pendingInterrupts = [];
@@ -2183,6 +2197,7 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
       recordProviderCooldown(visionEngineProvider(engine), {
         until: error.cooldownUntil,
         reason,
+        modelSlug: engine.slug,
       });
     }
     throw error;
@@ -2369,12 +2384,10 @@ async function bridgeVisionInput(input, route, request) {
   }
   const { effort } = settings;
   let fellBack = 0;
-  // A quota exhaustion is account/provider-wide evidence, not a reason to walk
-  // every model slug backed by that same account. Keep this set scoped to the
-  // current bridge call when the provider did not name a reset window; that
-  // avoids duplicate spend without inventing how long the quota will stay
-  // empty. A provider-named window is persisted by readVisionEvidence instead.
-  const exhaustedProviders = new Set();
+  // Keep no-reset exhaustion evidence local to the exact model allowance for
+  // this bridge call. A provider-named window is persisted under that same
+  // model scope by readVisionEvidence; healthy OpenCode siblings remain usable.
+  const exhaustedScopes = new Set();
   // Each engine in turn until one reads the image. The first is the operator's
   // choice and answers nearly always; the rest exist so a lapsed session or a
   // provider outage costs a slower read rather than the whole image.
@@ -2383,9 +2396,9 @@ async function bridgeVisionInput(input, route, request) {
     for (const [index, engine] of engines.entries()) {
       // The same identity the window was recorded under: a separately billed
       // variant shares this account's credential but not its allowance.
-      const provider = cooldownScope(visionEngineProvider(engine));
-      const cooled = providerCooldown(provider);
-      if (cooled || exhaustedProviders.has(provider)) {
+      const scope = cooldownScope(visionEngineProvider(engine), engine.slug);
+      const cooled = providerCooldown(visionEngineProvider(engine), { modelSlug: engine.slug });
+      if (cooled || exhaustedScopes.has(scope)) {
         lastError ??= new Error(
           `${engine.displayName || engine.slug} is temporarily unavailable because its provider reported a quota or rate limit`,
         );
@@ -2410,7 +2423,7 @@ async function bridgeVisionInput(input, route, request) {
         return { text, engineName: engine.displayName || engine.slug };
       } catch (error) {
         lastError = error;
-        if (error?.failureKind === "out_of_usage") exhaustedProviders.add(provider);
+        if (error?.failureKind === "out_of_usage") exhaustedScopes.add(scope);
       }
     }
     // Every engine refused, so the turn says what the last one said -- the
@@ -2758,7 +2771,7 @@ function compactionAttempts(route, aged, searchContract, { allowFailover = true 
     .slice(0, MAX_FAILOVER_HOPS)
     .map((entry) => entry.model);
   if (!candidates.length) return [route];
-  return providerCooldown(route.provider) ? candidates : [route, ...candidates];
+  return providerCooldown(route.provider, { modelSlug: route.slug }) ? candidates : [route, ...candidates];
 }
 
 // One compaction attempt against one model. Everything route-dependent lives
@@ -3022,7 +3035,7 @@ async function summarize(request, payload, route, signal, requestUrl, { allowFai
       });
     }
     if (sent.upstream.ok) {
-      clearProviderCooldown(attemptRoute.provider);
+      clearProviderCooldown(attemptRoute.provider, { modelSlug: attemptRoute.slug });
       const answer = extractResponseText(parsed);
       // finalizeCheckpoint turns empty model output into a structurally valid
       // checkpoint, so an upstream whose answer this router cannot read would
@@ -3068,7 +3081,7 @@ async function summarize(request, payload, route, signal, requestUrl, { allowFai
     lastSwapReason = verdict.swap ? verdict.reason : undefined;
     if (!allowFailover) return { ...last, failed };
     if (!verdict.swap) return { ...last, failed };
-    recordProviderCooldown(attemptRoute.provider, verdict);
+    recordProviderCooldown(attemptRoute.provider, { ...verdict, modelSlug: attemptRoute.slug });
     if (index + 1 < attempts.length) {
       logFailover(
         attemptRoute,
@@ -3768,7 +3781,7 @@ async function prepareRoutedRequest({
 function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContract, chain }) {
   const hidden = readHiddenModels();
   return rankFailoverCandidates(
-    selectedConfiguredListedModels().filter((model) => !hidden.has(model.slug)),
+    failoverReachableModels(selectedConfiguredListedModels(), { hidden, chain }),
     {
       from: route,
       // Context fit is checked after rebuilding the request for each
@@ -3872,6 +3885,7 @@ async function attemptModelFailover({
   agingEnabled,
   searchContract,
   progress,
+  chain,
 }) {
   const settings = readFailoverSettings();
   if (!settings.enabled) return undefined;
@@ -3882,14 +3896,14 @@ async function attemptModelFailover({
         route,
         agedInput,
         searchContract,
-        chain: settings.chain,
+        chain: chain || settings.chain,
       })
     : failoverCandidates({
         route,
         agedInput,
         flattenedNamespaces,
         searchContract,
-        chain: settings.chain,
+        chain: chain || settings.chain,
       }).slice(0, MAX_FAILOVER_HOPS);
   if (!candidates.length) {
     logFailover(route, undefined, verdict.reason, status, "no-candidate");
@@ -3975,7 +3989,7 @@ async function attemptModelFailover({
       logFailover(route, model, verdict.reason, status, upstream.status);
       return { route: model, built, upstream, failedBodyText: hopBodyText };
     }
-    if (hopVerdict.swap) recordProviderCooldown(model.provider, hopVerdict);
+    if (hopVerdict.swap) recordProviderCooldown(model.provider, { ...hopVerdict, modelSlug: model.slug });
     logFailover(route, model, verdict.reason, status, upstream.status);
   }
   return undefined;
@@ -4076,11 +4090,15 @@ async function handleResponses(request, response, requestUrl) {
     activity.progress.headers();
     return upstream;
   };
-  const diagnostics = { requestId: activity.requestId };
+  const diagnostics = {
+    requestId: activity.requestId,
+    ...activityMetadataFromHeaders(request.headers),
+  };
   let clientGone = false;
   let requestedModel = "";
   let servedModel = "";
   let route;
+  let profileRoutePlan;
   let upstreamRetries;
   let upstreamStatus;
   let upstreamLatencyMs;
@@ -4123,16 +4141,30 @@ async function handleResponses(request, response, requestUrl) {
     let payload = await parseBodyAsync(body);
     controller.signal.throwIfAborted();
     requestedModel = typeof payload.model === "string" ? payload.model : "";
-    let registeredRoute =
+    if (isOpenCodeProfileSlug(requestedModel)) {
+      diagnostics.requestedProfile = requestedModel;
+      profileRoutePlan = resolveOpenCodeProfile(requestedModel, {
+        headers: request.headers,
+        payload,
+        models: selectedConfiguredListedModels(),
+      });
+    }
+    let registeredRoute = profileRoutePlan?.route ??
       MODEL_BY_SLUG.get(requestedModel) ??
       MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
+    if (isOpenCodeProfileSlug(requestedModel) && !registeredRoute) {
+      // A profile with no healthy OpenCode candidate is already at the end of
+      // its provider chain. Continue immediately on the matching native class
+      // instead of asking the operator to reselect a model and repeat the turn.
+      payload = { ...payload, model: nativeFallbackModel(profileRoutePlan?.nativeClass) };
+    }
     // A provider-prefixed slug with no route is a routed model this process
     // never loaded -- added to user-models.json after startup, or skipped at
     // load as invalid -- and never native GPT traffic: no native slug contains
     // "/". Forwarding it earned ChatGPT's "not supported when using Codex with
     // a ChatGPT account" refusal and sent the prompt to OpenAI (#689). Refuse
     // it here, before the native redirect or the passthrough can take it.
-    if (!registeredRoute && isProviderPrefixedSlug(requestedModel)) {
+    if (!registeredRoute && !isOpenCodeProfileSlug(requestedModel) && isProviderPrefixedSlug(requestedModel)) {
       const prefix = requestedModel.slice(0, requestedModel.indexOf("/"));
       const provider = RUNTIME_PROVIDERS.get(prefix);
       writeJson(response, 400, unroutedModelError(requestedModel, {
@@ -4153,7 +4185,7 @@ async function handleResponses(request, response, requestUrl) {
     // them to the configured routed model; a target that is unknown or whose
     // provider is hidden leaves the turn native rather than trading a quota
     // failure for a routing error.
-    if (!registeredRoute && requestedModel) {
+    if (!registeredRoute && requestedModel && !isOpenCodeProfileSlug(requestedModel)) {
       const redirect = MODEL_BY_SLUG.get(readNativeRedirect());
       if (redirect && routeProviderEnabled(redirect.provider)) {
         registeredRoute = redirect;
@@ -4337,7 +4369,7 @@ async function handleResponses(request, response, requestUrl) {
       // the operator's chosen model comes back without anyone doing anything.
       const settings = readFailoverSettings();
       const cooled = !exactRouteProbe && !request.codexRouterWorkerCapability && settings.enabled
-        ? providerCooldown(route.provider)
+        ? providerCooldown(route.provider, { modelSlug: route.slug })
         : undefined;
       if (cooled) {
         const candidates = failoverCandidates({
@@ -4345,7 +4377,7 @@ async function handleResponses(request, response, requestUrl) {
           agedInput,
           flattenedNamespaces,
           searchContract,
-          chain: settings.chain,
+          chain: profileRoutePlan?.chain || settings.chain,
         }).slice(0, MAX_FAILOVER_HOPS);
         for (const next of candidates) {
           let candidate;
@@ -4548,7 +4580,7 @@ async function handleResponses(request, response, requestUrl) {
         // Believe the provider about when it will be back before trying anyone
         // else, so the next turn skips it instead of paying for the same
         // rejection again.
-        recordProviderCooldown(route.provider, verdict);
+        recordProviderCooldown(route.provider, { ...verdict, modelSlug: route.slug });
         const moved = await attemptModelFailover({
           progress: activity.progress,
           request,
@@ -4563,6 +4595,7 @@ async function handleResponses(request, response, requestUrl) {
           normalizedInput,
           agingEnabled,
           searchContract,
+          chain: profileRoutePlan?.chain,
         });
         let nativeMoved = false;
         if (moved) {
@@ -4583,7 +4616,7 @@ async function handleResponses(request, response, requestUrl) {
           failedBodyText = moved.failedBodyText;
         } else if (
           verdict.swap &&
-          ["out_of_usage", "rate_limited"].includes(verdict.reason) &&
+          ["out_of_usage", "rate_limited", "model_unavailable"].includes(verdict.reason) &&
           nativeSessionHeaders()
         ) {
           // OpenCode has definitively exhausted or rate-limited its allowance.
@@ -4598,6 +4631,7 @@ async function handleResponses(request, response, requestUrl) {
               requestUrl,
               compactV1: false,
               compactV2: false,
+              nativeClass: profileRoutePlan?.nativeClass,
             });
             const nativeAttempt = await fetchWithRetry(
               nativeBuilt.target,
@@ -4640,7 +4674,7 @@ async function handleResponses(request, response, requestUrl) {
             }
           } catch (error) {
             if (!controller.signal.aborted && !QUIET) {
-              console.error(`[codex-router] native fallback failed model=${nativeFallbackModel()} error=${error?.name || "Error"}`);
+              console.error(`[codex-router] native fallback failed model=${nativeFallbackModel(profileRoutePlan?.nativeClass)} error=${error?.name || "Error"}`);
             }
           }
         } else {
@@ -4665,7 +4699,7 @@ async function handleResponses(request, response, requestUrl) {
     // recorded earlier: a quota that refilled early, a limit the operator
     // raised, or a reset time the provider got wrong all end the same way, and
     // a real answer is better evidence than anything on disk.
-    if (route && upstream.ok) clearProviderCooldown(route.provider);
+    if (route && upstream.ok) clearProviderCooldown(route.provider, { modelSlug: route.slug });
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.

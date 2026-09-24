@@ -1296,7 +1296,9 @@ async function setRouterDefault(action, slug) {
     value = String(slug || "").trim();
     if (!value) throw new Error("Usage: control router-default set MODEL");
     const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
-    if (!selectedConfiguredListedModels().some((model) => model.slug === value)) {
+    const selected = selectedConfiguredListedModels();
+    const { profileCatalogModels } = await import("./opencode-profiles.mjs");
+    if (![...selected, ...profileCatalogModels(selected)].some((model) => model.slug === value)) {
       throw new Error(`${value} is not an enabled, authenticated external model.`);
     }
     const { modelPickerSnapshot } = await import("./model-picker-state.mjs");

@@ -33,6 +33,9 @@ test("usage events persist only bounded request metadata in a private file", asy
       searchSidecar: true,
       searchCacheHit: false,
       searchResults: 4,
+      sessionId: "session-1",
+      threadId: "thread-1",
+      requestedProfile: "opencode-go-profile/workhorse",
       prompt: "never persisted",
       credential: "never persisted",
     });
@@ -58,6 +61,9 @@ test("usage events persist only bounded request metadata in a private file", asy
         searchSidecar: true,
         searchCacheHit: false,
         searchResults: 4,
+        sessionId: "session-1",
+        threadId: "thread-1",
+        requestedProfile: "opencode-go-profile/workhorse",
       },
     ]);
     if (process.platform !== "win32") {

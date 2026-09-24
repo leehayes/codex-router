@@ -44,24 +44,22 @@ export const MIN_RATE_LIMIT_COOLDOWN_SECONDS = 60;
 // absurd `Retry-After` (some gateways send epoch seconds where seconds-from-now
 // belong) would otherwise strand the operator's chosen model for years.
 export const MAX_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+export const MODEL_UNAVAILABLE_COOLDOWN_MS = 5 * 60 * 1_000;
 
-// Two hops, so a turn costs at most two extra round trips before it either
-// succeeds or returns the failure it was always going to return.
-export const MAX_FAILOVER_HOPS = 2;
+// Profile routes may walk several independently metered OpenCode models before
+// native fallback. The wall-clock budget below remains the hard upper bound.
+export const MAX_FAILOVER_HOPS = 5;
 
 // The whole failover sequence, not each hop. A turn that has already spent this
 // long recovering is better off reporting the original failure than spending
 // more of the user's time on a third guess.
-export const FAILOVER_BUDGET_MS = 30_000;
+export const FAILOVER_BUDGET_MS = 45_000;
 
 const MAX_COOLDOWN_ENTRIES = 64;
 
-// Free before paid, and the operator's signed-in ChatGPT plan between them.
-// A free model is a real downgrade in capability, so it is not the first choice
-// on merit -- it is first because it is the only tier that cannot surprise
-// someone with a bill they did not choose to incur. The native tier sits second
-// because a ChatGPT subscription is already paid for and flat-rate. Metered
-// providers rank last, and only ones the operator explicitly enabled.
+// Default ordering for ordinary routed models. A signed profile supplies its
+// own quality-class chain, which takes precedence and tries suitable OpenCode
+// subscription routes before its class-matched native fallback.
 export const FAILOVER_TIER = Object.freeze({ free: 0, native: 1, subscription: 2 });
 
 function nowMs(now) {
@@ -100,6 +98,19 @@ export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now
   const at = nowMs(now);
   const retryAfter = Number(retryAfterSeconds);
   const kind = upstreamFailureKind({ status: code, bodyText });
+
+  // OpenCode uses an exact 403 when one catalogue model has been withdrawn or
+  // disabled while the rest of the subscription remains usable. That is
+  // model-scoped availability evidence, not a credential verdict. Step to the
+  // next profile candidate and avoid repeating the dead route for five minutes
+  // while the watcher refreshes the catalogue.
+  if (code === 403 && /\bmodel access is disabled\b/i.test(String(bodyText || ""))) {
+    return {
+      swap: true,
+      reason: "model_unavailable",
+      until: cappedUntil(at, MODEL_UNAVAILABLE_COOLDOWN_MS),
+    };
+  }
 
   // A plan that never included this API is not an exhausted balance, and no
   // other model on another provider makes it true. Checked first because the
@@ -235,9 +246,15 @@ export function readProviderCooldowns({ now } = {}) {
 
 // `undefined` once the window the provider named has passed, so expiry needs no
 // sweeper and a provider comes back by itself.
-export function providerCooldown(providerId, { now } = {}) {
-  const id = cooldownScope(String(providerId || "").trim());
-  return id ? readProviderCooldowns({ now })[id] : undefined;
+export function providerCooldown(providerId, { now, modelSlug } = {}) {
+  const provider = String(providerId || "").trim();
+  const live = readProviderCooldowns({ now });
+  const scoped = cooldownScope(provider, modelSlug);
+  const global = cooldownScope(provider);
+  if (canonicalProviderId(provider) === "opencode-go" && modelSlug) {
+    return scoped && live[scoped];
+  }
+  return (scoped && live[scoped]) || (global && live[global]);
 }
 
 // Only ever records a window the provider itself reported. A verdict with no
@@ -252,8 +269,8 @@ export function providerCooldown(providerId, { now } = {}) {
 // tell an exhausted plan from a burst rate limit. So a later caller with no
 // window of its own may sharpen the reason on a window that already exists.
 // It may never create one.
-export function recordProviderCooldown(providerId, { until, reason, now } = {}) {
-  const id = cooldownScope(String(providerId || "").trim());
+export function recordProviderCooldown(providerId, { until, reason, now, modelSlug } = {}) {
+  const id = cooldownScope(String(providerId || "").trim(), modelSlug);
   if (!id) return undefined;
   const at = nowMs(now);
   const document = readCooldownDocument();
@@ -281,8 +298,8 @@ export function recordProviderCooldown(providerId, { until, reason, now } = {}) 
 // limit the operator raised, a reset time the provider got wrong -- all three
 // end the same way, with a real answer, and that answer is better evidence than
 // anything this file recorded.
-export function clearProviderCooldown(providerId) {
-  const id = cooldownScope(String(providerId || "").trim());
+export function clearProviderCooldown(providerId, { modelSlug } = {}) {
+  const id = cooldownScope(String(providerId || "").trim(), modelSlug);
   if (!id) return false;
   const document = readCooldownDocument();
   if (!(id in document)) return false;
@@ -383,6 +400,16 @@ export function failoverTierCounts(models, providers = PROVIDERS) {
   return counts;
 }
 
+// Picker visibility controls what people see, not what a trusted virtual
+// profile may use internally. A profile's explicit chain can therefore reach
+// its hidden implementation models; ordinary failover still respects hides.
+export function failoverReachableModels(models, { hidden = new Set(), chain = [] } = {}) {
+  const explicitlyNamed = new Set(Array.isArray(chain) ? chain : []);
+  return (Array.isArray(models) ? models : []).filter(
+    (model) => !hidden.has(model?.slug) || explicitlyNamed.has(model?.slug),
+  );
+}
+
 function supportsImageInput(model) {
   return Array.isArray(model?.inputModalities) && model.inputModalities.includes("image");
 }
@@ -405,8 +432,16 @@ function eligible(
   },
 ) {
   if (!model?.slug) return false;
-  if (canonicalProviderId(model.provider) === fromProvider) return false;
-  if (cooled.has(cooldownScope(model.provider))) return false;
+  if (
+    canonicalProviderId(model.provider) === fromProvider &&
+    fromProvider !== "opencode-go"
+  ) return false;
+  const providerScope = cooldownScope(model.provider);
+  const modelScope = cooldownScope(model.provider, model.slug);
+  if (
+    cooled.has(modelScope) ||
+    (canonicalProviderId(model.provider) !== "opencode-go" && cooled.has(providerScope))
+  ) return false;
   if (Number.isFinite(estimatedTokens) && Number(model.contextWindow) < estimatedTokens) {
     return false;
   }

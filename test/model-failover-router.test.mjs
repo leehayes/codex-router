@@ -464,6 +464,14 @@ test("a turn whose provider is out of usage is served by the next model", async 
   }
 });
 
+const MODEL_DISABLED_BODY = JSON.stringify({
+  error: {
+    message: "Model access is disabled",
+    type: "invalid_request_error",
+    code: "model_access_disabled",
+  },
+});
+
 test("an exhausted OpenCode chain retries the authenticated native Codex session", async () => {
   const seen = [];
   const authRoot = mkdtempSync(path.join(os.tmpdir(), "native-fallback-auth-"));
@@ -506,6 +514,51 @@ test("an exhausted OpenCode chain retries the authenticated native Codex session
     assert.equal(served.provider, "openai");
     assert.equal(served.failoverFrom, PRIMARY.slug);
     assert.match(child.testErrors(), /reason=out_of_usage/);
+    assert.match(child.testErrors(), /-> gpt-5\.6-sol outcome=200/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("an unavailable OpenCode model retries the authenticated native Codex session", async () => {
+  const seen = [];
+  const authRoot = mkdtempSync(path.join(os.tmpdir(), "native-unavailable-fallback-auth-"));
+  const authPath = path.join(authRoot, "auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: { access_token: "test-native-session-token", account_id: "test-native-account" },
+  }), { encoding: "utf8", mode: 0o600 });
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push({ url: request.url, body, authorization: request.headers.authorization });
+    if (request.url.startsWith("/backend-api/codex/")) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(contentSse("native-fallback"));
+      return;
+    }
+    const payload = Buffer.from(MODEL_DISABLED_BODY, "utf8");
+    response.writeHead(403, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const child = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${gw.port}/backend-api/codex`,
+    CODEX_ROUTER_NATIVE_SESSION_FALLBACK: "1",
+    MODEL_ROUTER_CODEX_AUTH: authPath,
+  }, { chain: [PRIMARY.slug] });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /answered-by-native-fallback/);
+    assert.deepEqual(seen.map((entry) => entry.body.model), [PRIMARY.gatewayModel, "gpt-5.6-sol"]);
+    assert.equal(seen[1].authorization, "Bearer test-native-session-token");
+    assert.match(child.testErrors(), /reason=model_unavailable/);
     assert.match(child.testErrors(), /-> gpt-5\.6-sol outcome=200/);
   } finally {
     await stopChild(child);
@@ -1938,7 +1991,7 @@ test("a closed Go plan window does not withdraw the separately billed Zen route"
   const child = run(routerEnv(gw.port, routerPort), {
     userModels: [ZEN_CANDIDATE],
     cooldowns: {
-      "opencode-go": {
+      "opencode-go::glm-5.3": {
         until: new Date(Date.now() + 30 * 60_000).toISOString(),
         reason: "out_of_usage",
       },

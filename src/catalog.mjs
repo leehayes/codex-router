@@ -68,6 +68,7 @@ import { routedModelSearchAvailable } from "./search-capability.mjs";
 import {
   readModelsCache,
 } from "./native-account-catalog.mjs";
+import { profileCatalogModels } from "./opencode-profiles.mjs";
 
 export { readModelsCache } from "./native-account-catalog.mjs";
 
@@ -1077,7 +1078,8 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
   // advertising models the running gateway has no route for.
   assertStateOwnership("write the Codex model catalog");
   const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
-  const selectedModels = selectedConfiguredListedModels();
+  const underlyingModels = selectedConfiguredListedModels();
+  const selectedModels = [...underlyingModels, ...profileCatalogModels(underlyingModels)];
   const loginFree = loginFreeConfigured();
   // Before the picker state is read, not after: new router models are opt-in
   // in a normal signed-in Codex install.  Curation or a picker "show" action
