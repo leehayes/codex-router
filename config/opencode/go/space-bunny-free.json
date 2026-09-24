@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "opencode-go/space-bunny-free",
+      "gatewayModel": "opencode-go-space-bunny-free",
+      "upstreamModel": "space-bunny-free",
+      "provider": "opencode-go",
+      "listed": true,
+      "displayName": "Space Bunny Free (opencode Go)",
+      "description": "Limited-time free Space Bunny route through the opencode Go Chat Completions endpoint.",
+      "priority": 62,
+      "defaultEffort": "high",
+      "reasoningLevels": [
+        { "effort": "high", "description": "Adaptive reasoning" }
+      ],
+      "contextWindow": 131072,
+      "autoCompact": 111411,
+      "inputModalities": ["text"],
+      "compHash": "opencode-go-space-bunny-free-v1"
+    }
+  ]
+}

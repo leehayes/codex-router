@@ -238,6 +238,7 @@ const CURATION_ROUTES = Object.freeze({
     ]),
     responsesProvider: "opencode-go-responses",
     responsesModels: Object.freeze([
+      "gpt-6-luna",
       "gpt-5.6-luna",
       "grok-4.5",
       "grok-4.6",
@@ -264,6 +265,7 @@ const CURATION_ROUTES = Object.freeze({
       "mimo-v2.5",
       "mimo-v2.5-pro",
       "qwen3.5-plus",
+      "space-bunny-free",
       "x-preview-f",
     ]),
     models: Object.freeze({}),
